@@ -9,9 +9,7 @@ import base64
 import ujson
 import random
 import os
-from src.captcha import Distinguish
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
+import ddddocr
 
 # 禁用 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -19,11 +17,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class ICP:
     def __init__(self):
-        self.secretKey = None
-        self.wordCount = None
         self.auth_data = None
         self.cookie = None
-        self.distinguish = Distinguish()
         self.cookie_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.41 Safari/537.36 Edg/101.0.1210.32'}
         self.home = 'https://beian.miit.gov.cn/'
@@ -128,8 +123,6 @@ class ICP:
             self.p_uuid = response['params']['uuid']
             big_image = response['params']['bigImage']
             small_image = response['params']['smallImage']
-            self.secretKey = response['params']['secretKey']
-            self.wordCount = response['params']['wordCount']
 
             # # 保存大图
             # with open(f"./img/big/a-{tid}-{str(i)}.jpg", "wb") as big_img_file:
@@ -141,58 +134,43 @@ class ICP:
             # print(f"已获取{str(i)}张验证码")
         return big_image, small_image
 
-    def aes_ecb_encrypt(self, plaintext: bytes, key: bytes, block_size=16):
-        backend = default_backend()
-        cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=backend)
-
-        padding_length = block_size - (len(plaintext) % block_size)
-        plaintext_padded = plaintext + bytes([padding_length]) * padding_length
-
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(plaintext_padded) + encryptor.finalize()
-
-        return base64.b64encode(ciphertext).decode('utf-8')
-
-    def generate_pointjson(self, big_img, small_img, secretKey):
-        dis_result = self.distinguish.main(big_img, small_img)
-        if dis_result:
-            if len(dis_result) == 4:
-                self.debugprint(dis_result)
-            else:
-                self.debugprint(f"验证码小图识别失败！ {dis_result}")
-                return {"code": 103, "msg": "验证码小图识别失败"}
-        else:
-            self.debugprint(f"验证码大图识别失败！ {dis_result}")
-            return {"code": 101, "msg": "验证码大图识别失败"}
-        new_points = [[p[0], p[1]] for p in dis_result]
-        pointJson = [{"x": p[0], "y": p[1]} for p in new_points]
-        self.debugprint(json.dumps(pointJson))
-        enc_pointJson = self.aes_ecb_encrypt(json.dumps(pointJson).replace(" ", "").encode(), secretKey.encode())
-        self.debugprint(enc_pointJson)
-        return {"code": 200, "data": enc_pointJson}
-
     def check_img(self, big_image, small_image):
-        # 识别验证码
-        pointJson = self.generate_pointjson(big_image, small_image, self.secretKey)
-        # 识别错误
-        if not pointJson["code"] == 200:
-            return pointJson
-        pointJson = pointJson["data"]
-        # 判断验证码
-        data = ujson.loads(ujson.dumps({"token": self.p_uuid,
-                                        "secretKey": self.secretKey,
-                                        "clientUid": self.clientUid,
-                                        "pointJson": pointJson}))
-        length = str(len(str(data).encode('utf-8')))
-        self.base_header.update({'Content-Length': length})
-        with self.session.request(method="POST", url=self.checkImage, json=data, headers=self.base_header) as req:
-            res = req.text
-            data = ujson.loads(res)
-            if not data["success"]:
-                self.debugprint(f"验证码识别识别 {data}")
-                return {"code": 104, "msg": "验证码识别失败"}
-            sign = data["params"]["sign"]
-            return {"code": 200, "data": sign}
+        try:
+            big_bytes = base64.b64decode(big_image)
+            small_bytes = base64.b64decode(small_image)
+            
+            # 使用 ddddocr 进行滑块缺口识别
+            ocr = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
+            res = ocr.slide_match(small_bytes, big_bytes, simple_target=True)
+            
+            if not res or 'target' not in res:
+                return {"code": 101, "msg": "滑块缺口识别失败"}
+                
+            # x_offset 为缺口 X 坐标
+            x_offset = res['target'][0]
+            
+            data = {
+                "key": self.p_uuid,
+                "value": str(x_offset)
+            }
+            
+            # 交由 requests 自动计算和设置正确的 Content-Length
+            if 'Content-Length' in self.base_header:
+                del self.base_header['Content-Length']
+                
+            with self.session.request(method="POST", url=self.checkImage, json=data, headers=self.base_header) as req:
+                resp_data = req.json()
+                if not resp_data.get("success"):
+                    self.debugprint(f"验证码识别失败 {resp_data}")
+                    return {"code": 104, "msg": "验证码识别失败"}
+                
+                # 兼容不同返回格式：有些版本 params 内含 sign 字典，有些直接就是 sign 字符串
+                params = resp_data.get("params", {})
+                sign = params.get("sign", "") if isinstance(params, dict) else params
+                return {"code": 200, "data": sign}
+        except Exception as e:
+            self.debugprint(f"滑块验证异常: {e}")
+            return {"code": 103, "msg": f"滑块验证异常: {e}"}
 
     def get_beian(self, sign, domain):
         info = {'pageNum': '', 'pageSize': '', 'unitName': domain, "serviceType": 1}
@@ -247,4 +225,3 @@ if __name__ == '__main__':
 
     end = time.time()
     print(end - start)
-
